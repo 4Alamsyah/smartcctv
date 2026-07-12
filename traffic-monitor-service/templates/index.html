@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Traffic Monitor</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <style>
+        html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, sans-serif; }
+        .layout { display: flex; flex-direction: column; height: 100%; }
+
+        .camera-row {
+            display: flex; gap: 10px; padding: 10px; overflow-x: auto;
+            background: #111827; flex-shrink: 0;
+        }
+        .camera-panel { flex: 0 0 auto; width: 320px; }
+        .camera-label { color: #e5e7eb; font-size: 12px; padding: 4px 2px; }
+        .camera-label .code { color: #9ca3af; }
+        .camera-feed { width: 320px; height: 180px; object-fit: cover; border-radius: 8px; background: #000; display: block; }
+        .camera-empty { color: #9ca3af; font-size: 13px; padding: 8px; }
+
+        .map-wrap { position: relative; flex: 1 1 auto; min-height: 0; }
+        #map { position: absolute; inset: 0; }
+
+        .status-panel {
+            position: absolute; top: 12px; left: 12px; z-index: 1000;
+            background: rgba(255,255,255,0.92); border: 1px solid #e5e7eb; border-radius: 10px;
+            padding: 8px 12px; font-size: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .status-row { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+        .status-dot { width: 8px; height: 8px; border-radius: 999px; }
+        .status-dot.connected { background: #10b981; }
+        .status-dot.connecting { background: #f59e0b; }
+        .status-dot.disconnected { background: #ef4444; }
+        .status-meta { margin-top: 4px; color: #6b7280; }
+        .header-bar {
+            position: absolute; top: 12px; right: 12px; z-index: 1000;
+            background: rgba(255,255,255,0.92); border: 1px solid #e5e7eb; border-radius: 10px;
+            padding: 8px 12px; font-size: 12px; color: #6b7280; box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .popup-title { font-weight: 700; }
+        .popup-meta { color: #6b7280; font-size: 12px; }
+        .popup-frame { width: 100%; border-radius: 6px; margin-top: 6px; }
+    </style>
+</head>
+<body>
+    <div class="layout">
+        <div class="camera-row">
+            {% for cam in cameras %}
+            <div class="camera-panel">
+                <div class="camera-label">{{ cam.name }} <span class="code">({{ cam.code }})</span></div>
+                <img class="camera-feed" src="/traffic-monitor/camera/{{ cam.code | urlencode }}/feed" alt="{{ cam.name }} live feed">
+            </div>
+            {% else %}
+            <div class="camera-empty">No active cameras.</div>
+            {% endfor %}
+        </div>
+
+        <div class="map-wrap">
+            <div id="map"></div>
+            <div class="status-panel">
+                <div class="status-row">
+                    <span id="status-dot" class="status-dot connecting"></span>
+                    <span id="status-label">Connecting&hellip;</span>
+                </div>
+                <div class="status-meta"><span id="total-count">{{ total_count }}</span> pending &middot; <span id="live-count">0</span> new this session</div>
+            </div>
+            <div class="header-bar">Traffic Monitor (served by traffic-monitor-service)</div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+    <script src="https://js.pusher.com/8.4/pusher.min.js"></script>
+    <script>
+        const JAKARTA_CENTER = [-6.2088, 106.8456];
+        const initialViolations = {{ violations_json | safe }};
+        const reverbConfig = {{ reverb_config_json | safe }};
+
+        const map = L.map('map', { zoomControl: true }).setView(JAKARTA_CENTER, 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors',
+            maxZoom: 19,
+        }).addTo(map);
+
+        const heatPoints = [];
+        const heatLayer = L.heatLayer([], { radius: 28, blur: 22, maxZoom: 17 }).addTo(map);
+        const markerLayer = L.layerGroup().addTo(map);
+
+        function violationWeight(type) {
+            return type === 'busway_lane_intrusion' ? 1.0 : 0.6;
+        }
+
+        function markerIcon(type) {
+            const color = type === 'busway_lane_intrusion' ? '#dc2626' : '#f59e0b';
+            return L.divIcon({
+                className: '',
+                html: `<span style="display:block;width:12px;height:12px;border-radius:9999px;background:${color};box-shadow:0 0 0 3px rgba(0,0,0,0.15)"></span>`,
+                iconSize: [12, 12],
+            });
+        }
+
+        function popupHtml(v) {
+            const label = v.violation_type === 'busway_lane_intrusion' ? 'Busway Lane Intrusion' : 'Illegal Parking';
+            const frame = v.frame_url ? `<img class="popup-frame" src="${v.frame_url}" alt="Evidence frame">` : '';
+            const detectedAt = v.detected_at ? new Date(v.detected_at).toLocaleString('id-ID') : '';
+            return `
+                <div style="min-width:200px">
+                    <div class="popup-title">${label}</div>
+                    Plate: ${v.plate_number ?? 'Unreadable'}<br>
+                    Stationary: ${Math.round(v.stationary_seconds / 60)} min<br>
+                    <span class="popup-meta">${detectedAt}</span>
+                    ${frame}
+                </div>
+            `;
+        }
+
+        function addPoint(lng, lat, weight) {
+            heatPoints.push([lat, lng, weight]);
+            heatLayer.setLatLngs(heatPoints);
+        }
+
+        function addMarker(v, opts) {
+            const marker = L.marker([v.lat, v.lng], { icon: markerIcon(v.violation_type) })
+                .bindPopup(popupHtml(v))
+                .addTo(markerLayer);
+            if (opts && opts.openPopup) marker.openPopup();
+            return marker;
+        }
+
+        for (const v of initialViolations) {
+            addPoint(v.lng, v.lat, violationWeight(v.violation_type));
+            addMarker(v);
+        }
+
+        function setStatus(state) {
+            const dot = document.getElementById('status-dot');
+            const label = document.getElementById('status-label');
+            dot.className = 'status-dot ' + state;
+            label.textContent = state === 'connected' ? 'Live' : state === 'connecting' ? 'Connecting…' : 'Offline';
+        }
+
+        let liveCount = 0;
+        function bumpLiveCount() {
+            liveCount += 1;
+            document.getElementById('live-count').textContent = String(liveCount);
+        }
+
+        const pusher = new Pusher(reverbConfig.key, {
+            // pusher-js's constructor throws synchronously if `cluster` is
+            // absent (see validateOptions in pusher-js/dist/web/pusher.js) --
+            // Reverb doesn't use it, but the key must still be present.
+            // Laravel Echo passes this same empty string for broadcaster
+            // 'reverb' internally (node_modules/laravel-echo/dist/echo.js).
+            cluster: '',
+            wsHost: reverbConfig.host,
+            wsPort: reverbConfig.port,
+            wssPort: reverbConfig.port,
+            forceTLS: reverbConfig.scheme === 'https',
+            enabledTransports: ['ws', 'wss'],
+            disableStats: true,
+            authEndpoint: '/broadcasting/auth',
+        });
+
+        pusher.connection.bind('connected', () => setStatus('connected'));
+        pusher.connection.bind('connecting', () => setStatus('connecting'));
+        pusher.connection.bind('disconnected', () => setStatus('disconnected'));
+        pusher.connection.bind('unavailable', () => setStatus('disconnected'));
+
+        const channel = pusher.subscribe('private-dispatch-center');
+        channel.bind('violation.detected', (event) => {
+            bumpLiveCount();
+            addPoint(event.lng, event.lat, violationWeight(event.violation_type));
+            addMarker(event, { openPopup: true });
+            map.panTo([event.lat, event.lng], { animate: true });
+        });
+    </script>
+</body>
+</html>
